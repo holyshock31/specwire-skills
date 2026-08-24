@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // specwire-archive-change（任务归档）：同步 main → openspec archive → archived trailer 推送 → 验证（GitLab Issue closed + Multica 卡提示）
-// 用法：node <技能目录>/scripts/specwire-archive-change.mjs <change-id> [--stash] [--dry-run] [--repo <group/project>]
+// 用法：node <技能目录>/scripts/specwire-archive-change.mjs <change-id> [--stash] [--no-validate] [--dry-run] [--repo <group/project>]
 // 边界：不删 change 分支；不直接调用 Bridge API——事件驱动：archived trailer 推送触发 Bridge 自动关 Issue/置卡 done
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
@@ -11,9 +11,10 @@ process.on('uncaughtException', (e) => { console.error(`✗ ${e.message}`); proc
 
 function usage() {
   console.log(`用法：
-  node <技能目录>/scripts/specwire-archive-change.mjs <change-id> [--stash] [--dry-run] [--repo <group/project>]
+  node <技能目录>/scripts/specwire-archive-change.mjs <change-id> [--stash] [--no-validate] [--dry-run] [--repo <group/project>]
 说明：将已合并的 change 归档（同步 main → openspec archive → archived trailer 推送 → 验证闭环）
   --stash          自动暂存已跟踪修改并全程还原（同 specwire-initiate-change）
+  --no-validate    跳过 OpenSpec 工件校验（仅应在校验失败且用户明确授权后使用）
   --dry-run        预览将执行的命令，不执行`);
 }
 
@@ -22,12 +23,14 @@ const argv = process.argv.slice(2);
 let changeId = null;
 let repo = null;
 let stashOpt = false;
+let noValidate = false;
 let dryRun = false;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--help' || a === '-h') { usage(); process.exit(0); }
   else if (a === '--repo') { repo = argv[++i]; if (!repo) die('--repo 需要 group/project'); }
   else if (a === '--stash') stashOpt = true;
+  else if (a === '--no-validate') noValidate = true;
   else if (a === '--dry-run') dryRun = true;
   else if (a.startsWith('-')) die(`未知参数：${a}`);
   else if (changeId) die('只接受一个 change-id');
@@ -69,7 +72,7 @@ if (!repo) {
   if (remoteName !== 'origin') console.log(`→ 项目推断自 remote「${remoteName}」`);
 }
 let defBranch = null;
-const headRef = gitOut(['symbolic-ref', '--short', `refs/remotes/origin/HEAD`]);
+const headRef = gitOut(['symbolic-ref', '--short', `refs/remotes/${remoteName}/HEAD`]);
 if (headRef) defBranch = headRef.split('/').pop();
 if (!defBranch) { defBranch = 'main'; console.log('→ 无法解析远端默认分支，fallback main'); }
 
@@ -90,26 +93,60 @@ if (state === 'active') {
     : '⚠ 未发现 implementation.md（确定已实现？确认后继续）');
 }
 
-// ---------- 同步 main（仅 active 需要；--stash 全程还原） ----------
-let stashed = false;
+// ---------- dry-run 预览：严格零写入，必须早于 stash / checkout / fetch / merge ----------
+if (dryRun) {
+  const cur = gitOut(['rev-parse', '--abbrev-ref', 'HEAD']) ?? 'HEAD';
+  const trackedDirty = Boolean(gitOut(['status', '--porcelain', '--untracked-files=no']));
+  console.log('\n[dry-run] 将执行：');
+  if (state === 'active') {
+    if (trackedDirty && !stashOpt) console.log('  阻塞条件：工作区有已跟踪修改；实际执行前需选择 --stash 或自行清理');
+    if (cur !== defBranch && !stashOpt) console.log(`  阻塞条件：当前分支为 ${cur}；实际执行前需选择 --stash 或切到 ${defBranch}`);
+    if (stashOpt) console.log('  git stash push（仅在存在已跟踪修改时创建独立 stash，结束后精确还原）');
+    if (cur !== defBranch) console.log(`  git checkout ${defBranch}`);
+    console.log(`  git fetch ${remoteName} ${defBranch}`);
+    console.log(`  git merge --ff-only ${remoteName}/${defBranch}`);
+    console.log(`  openspec archive ${changeId} -y --json${noValidate ? ' --no-validate' : ''}`);
+    console.log('  精确暂存：git add <归档前后快照差分路径>（仅归档改动，不含工作区其他内容）');
+    console.log(`  git commit -m "spec: archive ${changeId}" -m "SpecWire-Event: archived" -m "SpecWire-Change: ${changeId}"`);
+    console.log(`  git push ${remoteName} ${defBranch}`);
+    if (stashOpt) console.log(`  切回 ${cur}，并仅还原本次创建的 stash`);
+  }
+  console.log('  验证：glab issue list 找 [change] <id> → 轮询 closed；multica issue list 核对卡状态');
+  console.log('\n[dry-run] 未执行 stash、checkout、fetch、merge、归档、提交、推送或验证。');
+  process.exit(0);
+}
+
+// ---------- 同步默认分支（仅 active 需要；--stash 全程还原） ----------
+let stashCommit = null;
 let origBranch = null;
+let origRef = null;
+let switchedBranch = false;
+
+function stashTrackedChanges() {
+  const before = gitOut(['rev-parse', '--verify', 'refs/stash']);
+  const r = spawnSync('git', ['stash', 'push', '-m', `specwire-archive-change: ${changeId}`], { encoding: 'utf8' });
+  if (r.status !== 0) die(`git stash push 失败：${(r.stderr || r.stdout || '').trim().slice(0, 200)}`);
+  const after = gitOut(['rev-parse', '--verify', 'refs/stash']);
+  if (after && after !== before) {
+    console.log('→ --stash：已暂存工作区已跟踪修改');
+    return after;
+  }
+  console.log('→ --stash：没有需要暂存的已跟踪修改');
+  return null;
+}
+
 try {
   if (state === 'active') {
     origBranch = gitOut(['rev-parse', '--abbrev-ref', 'HEAD']) ?? 'HEAD';
+    origRef = origBranch === 'HEAD' ? git(['rev-parse', 'HEAD']) : origBranch;
     const cur = origBranch;
+    const trackedDirty = Boolean(gitOut(['status', '--porcelain', '--untracked-files=no']));
+    if (trackedDirty && !stashOpt) die('工作区有已跟踪修改；请先处理，或在用户确认后加 --stash 自动暂存并还原');
+    if (stashOpt) stashCommit = stashTrackedChanges();
     if (cur !== defBranch) {
       if (!stashOpt) die(`需在 ${defBranch} 分支归档（当前 ${cur}）；或加 --stash 自动处理`);
-      spawnSync('git', ['stash', 'push', '-m', `specwire-archive-change: ${changeId}`], { encoding: 'utf8' });
-      stashed = true;
-      console.log('→ --stash：已暂存已跟踪修改');
       git(['checkout', defBranch]);
-    }
-    if (stashOpt && !stashed) {
-      const r = spawnSync('git', ['stash', 'push', '-m', `specwire-archive-change: ${changeId}`], { encoding: 'utf8' });
-      if (r.status === 0 && !/No local changes/.test(`${r.stdout} ${r.stderr}`)) {
-        stashed = true;
-        console.log('→ --stash：已暂存已跟踪修改');
-      }
+      switchedBranch = true;
     }
     git(['fetch', '-q', remoteName, defBranch]);
     const m = spawnSync('git', ['merge', '--ff-only', `${remoteName}/${defBranch}`], { encoding: 'utf8' });
@@ -117,25 +154,12 @@ try {
     console.log(`→ main 已同步（含 MR 合并结果）`);
   }
 
-  // ---------- dry-run 预览 ----------
-  if (dryRun) {
-    console.log('\n[dry-run] 将执行：');
-    if (state === 'active') {
-      console.log(`  openspec archive ${changeId} -y --json`);
-      console.log('  精确暂存：git add <归档前后快照差分路径>（仅归档改动，不含工作区其他内容）');
-      console.log(`  git commit -m "spec: archive ${changeId}" -m "SpecWire-Event: archived" -m "SpecWire-Change: ${changeId}"`);
-      console.log(`  git push origin ${defBranch}`);
-    }
-    console.log('  验证：glab issue list 找 [change] <id> → 轮询 closed；multica issue list 核对卡状态');
-    console.log('\n[dry-run] 未执行任何操作。');
-    process.exit(0);
-  }
-
   // ---------- 归档（仅 active；非交互；commit 仅含归档改动本身） ----------
   if (state === 'active') {
     console.log(`→ openspec archive ${changeId} ...`);
     const before = spawnSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).stdout;
-    const ar = spawnSync('openspec', ['archive', changeId, '-y', '--json'], { encoding: 'utf8', timeout: 120000 });
+    const archiveArgs = ['archive', changeId, '-y', '--json', ...(noValidate ? ['--no-validate'] : [])];
+    const ar = spawnSync('openspec', archiveArgs, { encoding: 'utf8', timeout: 120000 });
     if (ar.status !== 0) die(`openspec archive 失败：${(ar.stderr || ar.stdout || '').trim().slice(0, 300)}（tasks 未勾完或工件不一致？先补全再试，或经确认 --no-validate）`);
     console.log('→ 归档完成（规格已并入 + change 移入 archive/）');
     // 精确暂存：仅归档产生的前后快照差分（不裹挟工作区其他改动）
@@ -184,9 +208,19 @@ try {
   console.error(`✗ ${e.message}`);
   process.exitCode = 1;
 } finally {
-  if (stashed) {
-    let r = spawnSync('git', ['checkout', origBranch], { encoding: 'utf8' });
-    if (r.status === 0) r = spawnSync('git', ['stash', 'pop'], { encoding: 'utf8' });
-    console.log(r.status === 0 ? '→ --stash：已切回原分支并还原工作区' : `⚠ --stash 还原失败：${(r.stderr || '').trim().slice(0, 150)}`);
+  let branchReady = true;
+  if (switchedBranch) {
+    const r = spawnSync('git', ['checkout', origRef], { encoding: 'utf8' });
+    branchReady = r.status === 0;
+    if (!branchReady) console.error(`⚠ 无法切回原分支 ${origBranch}：${(r.stderr || r.stdout || '').trim().slice(0, 150)}`);
+    else if (!stashCommit) console.log(`→ --stash：已切回原分支 ${origBranch}（本次未创建 stash）`);
+  }
+  if (stashCommit && branchReady) {
+    const top = gitOut(['rev-parse', '--verify', 'refs/stash']);
+    const args = top === stashCommit ? ['stash', 'pop', '--index', 'stash@{0}'] : ['stash', 'apply', '--index', stashCommit];
+    const r = spawnSync('git', args, { encoding: 'utf8' });
+    if (r.status === 0 && top === stashCommit) console.log('→ --stash：已还原本次暂存的工作区修改');
+    else if (r.status === 0) console.log(`⚠ 已还原本次工作区修改，但 stash 栈已变化；为安全起见保留记录 ${stashCommit.slice(0, 12)}`);
+    else console.error(`⚠ --stash 还原失败；本次 stash ${stashCommit.slice(0, 12)} 仍保留：${(r.stderr || r.stdout || '').trim().slice(0, 180)}`);
   }
 }

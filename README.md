@@ -52,6 +52,8 @@ npx skills add holyshock31/specwire-skills \
 
 安装后直接用自然语言要求 Agent 执行对应任务，也可以使用宿主支持的显式技能调用语法。
 
+参数交互采用“Agent 询问、脚本确定性执行”的分层：Agent 先从自然语言和仓库状态推断参数，只对缺失的关键选择、异常覆盖和远端写操作授权进行一次性追问；Node.js 脚本不依赖 TTY，收到完整参数后直接执行。因此同一技能可在 Codex、Claude Code 等不同 Agent 中复用，各宿主只需使用自己的提问界面。
+
 ## 前置依赖
 
 - Node.js 18 或更高版本；
@@ -84,5 +86,11 @@ skills/
 ```
 
 每个目录包含必需的 `SKILL.md` 和自包含 Node.js 脚本。脚本由 Agent 解析技能目录后以 `node` 执行，不要求额外的全局 SpecWire 命令。
+
+安全回归测试可用以下命令运行：
+
+```bash
+node --test tests/safety-regressions.test.mjs
+```
 
 实现方式的选型与多 Agent 调研见 [npm 技能安装方案调研](docs/npm-skill-installation-research.md)。

@@ -22,7 +22,9 @@ function usage() {
   node <技能目录>/scripts/specwire-review-change.mjs <change-id> --mr <编号> # 严格校验（MR 必须关联该 change-id）
   --repo <group/project>                # 覆盖 remote 推断
   --diff                                # 控制台输出完整 diff（按需，默认只给入口）
-  --diff-file <path>                    # 只输出某文件的 diff（--diff 的单文件版）`);
+  --diff-file <path>                    # 只输出某文件的 diff（--diff 的单文件版）
+  --allow-non-main                      # 允许评审目标分支不是 main（需用户明确确认）
+  --allow-unlinked                      # 允许 MR 未声明 change-id（需用户明确确认）`);
 }
 
 // ---------- 参数解析 ----------
@@ -32,6 +34,8 @@ let mr = null;
 let repo = null;
 let diffOpt = false;
 let diffFile = null;
+let allowNonMain = false;
+let allowUnlinked = false;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--help' || a === '-h') { usage(); process.exit(0); }
@@ -39,6 +43,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--repo') { repo = argv[++i]; if (!repo) die('--repo 需要 group/project'); }
   else if (a === '--diff') diffOpt = true;
   else if (a === '--diff-file') { diffFile = argv[++i]; if (!diffFile) die('--diff-file 需要文件路径'); }
+  else if (a === '--allow-non-main') allowNonMain = true;
+  else if (a === '--allow-unlinked') allowUnlinked = true;
   else if (a.startsWith('-')) die(`未知参数：${a}`);
   else if (changeId) die('只接受一个 change-id（放 --mr 前）');
   else { changeId = a; }
@@ -96,7 +102,8 @@ try { mrd = JSON.parse(view.stdout); } catch { die(`glab mr view 输出解析失
 const source = mrd.source_branch;
 const target = mrd.target_branch || 'main';
 if (!source) die(`MR #${mr} 缺少 source_branch`);
-if (target !== 'main') console.log(`⚠ 目标分支非 main：${target}`);
+if (target !== 'main' && !allowNonMain) die(`MR #${mr} 的目标分支是 ${target}，不是 main；确认无误后显式加 --allow-non-main`);
+if (target !== 'main') console.log(`⚠ 已显式允许评审非 main 目标分支：${target}`);
 const desc = `${mrd.description || ''}\n${mrd.title || ''}`;
 if (changeId) {
   if (!desc.includes(changeId)) die(`MR #${mr} 未关联 change-id「${changeId}」（严格校验失败，防审错 MR）`);
@@ -104,7 +111,8 @@ if (changeId) {
 } else {
   const m = desc.match(/(?:SpecWire-Change|change_id)[:：]\s*([a-zA-Z0-9-]+)/);
   if (m) { changeId = m[1]; console.log(`→ 从 MR 描述提取 change_id：${changeId}`); }
-  else console.log('⚠ MR 未声明关联变更（描述缺 SpecWire-Change / change_id）');
+  else if (!allowUnlinked) die(`MR #${mr} 未声明关联变更（描述缺 SpecWire-Change / change_id）；确认仍要评审后显式加 --allow-unlinked`);
+  else console.log('⚠ 已显式允许评审未声明 change-id 的 MR');
 }
 
 // ---------- 拉取 + 改动范围 ----------

@@ -19,7 +19,19 @@ node "<技能目录>/scripts/specwire-review-change.mjs" --mr <编号>          
 node "<技能目录>/scripts/specwire-review-change.mjs" <change-id> --mr <编号>  # 严格校验（MR 必须关联该 change-id，防审错）
 ```
 
-可选：`--repo <group/project>`（覆盖 remote 推断）；`--diff`（控制台输出完整 diff）；`--diff-file <path>`（只输出某文件 diff）。
+可选：`--repo <group/project>`（覆盖 remote 推断）；`--diff`（控制台输出完整 diff）；`--diff-file <path>`（只输出某文件 diff）；`--allow-non-main`（显式允许非 main 目标）；`--allow-unlinked`（显式允许未关联 change-id）。
+
+## 参数收集与异常确认
+
+脚本保持非交互；由 Agent 负责选择与追问。先用只读信息推断，已明确的不要再问，多个异常合并成一次询问。
+
+1. 用户未给 MR 编号时，先运行无 `--mr` 的列表模式，把打开中的 MR 作为选项展示给用户；只有唯一候选且用户指代清楚时才可直接采用。
+2. 用户给了 change-id 时一并传入，启用严格关联校验；未给则让脚本从 MR 描述提取。
+3. MR 目标不是 `main` 时停止并说明源/目标分支；只有用户明确确认仍要评审，才追加 `--allow-non-main`。
+4. MR 未声明 `SpecWire-Change` / `change_id` 时停止；询问补充 MR 元数据还是继续评审，只有明确选择继续时才追加 `--allow-unlinked`。
+5. 默认只输出 diff 摘要和入口。仅当用户要求完整差异或指定文件时使用 `--diff` / `--diff-file`，不为此例行追问。
+
+用户要求“评审/验证”已授权 fetch、创建隔离 worktree 和运行仓库已有测试；这不包含合并授权。不要在本技能中合并 MR。
 
 ## 意图映射（自然语言 → 参数）
 
@@ -30,6 +42,8 @@ node "<技能目录>/scripts/specwire-review-change.mjs" <change-id> --mr <编�
 | 这个变更的 MR（严格校验关联） | `<change-id> --mr <编号>` |
 | 项目推断不对 | `--repo <group/project>` |
 | 想看完整差异内容 | `--diff` / `--diff-file <路径>` |
+| 确认评审非 main 目标 | `--allow-non-main` |
+| 确认评审未关联 change 的 MR | `--allow-unlinked` |
 
 ## 流程
 

@@ -22,6 +22,15 @@ node "<技能目录>/scripts/specwire-preflight.mjs" [init|review|merge|archive|
 - `--bridge`：附加检查 Bridge 容器运行状态（并提示其 token 与 glab 独立）
 - 退出码：0 = 无 ❌；1 = 存在 ❌
 
+## 参数收集
+
+执行前先从用户原话与当前仓库推断参数；只在结论会改变检查范围时提问，并把缺失项合并成一次询问：
+
+- 用户明确说“发起前 / 评审前 / 合并前 / 归档前”时，分别选 `init` / `review` / `merge` / `archive`；未指明环节时直接用默认 `all`，不要追问。
+- 优先从 GitLab remote 推断项目。只有推断失败、存在多个候选且会影响阶段检查时，才询问 `group/project`。
+- 仅当用户明确要求检查 Bridge，或问题本身是“归档后 Issue/卡片未闭环”时追加 `--bridge`；普通体检不询问此项。
+- 体检只输出证据和建议。除非用户另行要求修复，否则不要执行报告中的修复命令。
+
 ## 检查清单
 
 | 组 | 项 | 失败修复建议（固化本机教训） |
@@ -35,7 +44,7 @@ node "<技能目录>/scripts/specwire-preflight.mjs" [init|review|merge|archive|
 
 ## 边界
 
-- **不修复、不推送、不提交**：全只读探测（fetch 为只读网络操作）
+- **不修复、不推送、不提交**：不改工作树与远端；为比较分叉会更新本地 remote-tracking ref
 - 与四件套的定位差异：四件套做**事**，preflight 看**能不能做**（准入体检）；故障时也可先跑 `specwire-preflight <环节>` 定位
 - 体检结果**不替代**环节内校验（以各环节实际结果为准）
 

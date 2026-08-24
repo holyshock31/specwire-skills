@@ -14,12 +14,26 @@ description: 许可合并——校验 MR 关联与状态 → glab mr merge → �
 先将 `scripts/specwire-merge-change.mjs` 相对于本 `SKILL.md` 所在目录解析为绝对路径，再执行：
 
 ```bash
-node "<技能目录>/scripts/specwire-merge-change.mjs" <change-id> --mr <编号> [--squash] [--dry-run] [--repo <group/project>]
+node "<技能目录>/scripts/specwire-merge-change.mjs" <change-id> --mr <编号> [--squash] [--force-cleanup] [--allow-non-main] [--dry-run] [--repo <group/project>]
 ```
 
 - `--squash`：压缩合并（默认常规 merge commit，保留实现提交与 trailer——**首次建议不加**，见下）
+- `--force-cleanup`：强制删除有未提交修改的评审 worktree；只可在用户明确同意丢弃这些修改后使用
+- `--allow-non-main`：允许目标分支不是 main；只可在用户确认目标分支后使用
 - `--dry-run`：只预览将执行的命令与清理清单，不执行
 - `--repo`：覆盖 remote 推断
+
+## 参数收集与合并授权
+
+合并是不可由“评审通过”隐含授权的远端变更。脚本保持非交互；Agent 必须在执行前完成以下处理：
+
+1. 必须有 MR 编号和 kebab-case change-id。缺少时先用 `glab mr list/view` 只读查找候选并让用户确认；不要猜测多个候选中的一个。
+2. 只有当前用户消息明确要求“合并”该 MR 才执行。仅说“验证通过”“可以进入下一步”或询问状态时，展示 MR、源/目标分支和合并方式后询问许可；`--dry-run` 也不能替代真实合并授权。
+3. 默认常规 merge，不例行询问 squash。只有用户主动要求压缩历史时追加 `--squash`。
+4. 目标分支不是 `main` 时停止并询问；用户明确确认该目标后才追加 `--allow-non-main`。
+5. 合并前只读检查 `.worktrees/review-<mr>` 与 `base-<mr>`。干净 worktree 可正常清理；有未提交修改时默认保留并报告。只有用户明确同意丢弃这些修改时才追加 `--force-cleanup`。
+
+在所有必要选择与合并授权到齐后，一次性调用脚本。
 
 ## 意图映射（自然语言 → 参数）
 
@@ -28,12 +42,14 @@ node "<技能目录>/scripts/specwire-merge-change.mjs" <change-id> --mr <编号
 | 验证通过了，合并这个 MR | `<change-id> --mr <编号>` |
 | 压缩合并（历史清爽） | 追加 `--squash` |
 | 先看看会做什么 | 追加 `--dry-run` |
+| 确认合并到非 main 目标 | 追加 `--allow-non-main` |
+| 确认丢弃脏评审 worktree | 追加 `--force-cleanup` |
 
 ## 流程
 
 1. 校验：MR 存在且 `opened`、目标 main、描述/标题必须含 change-id（**强校验——防合并错 MR**）
 2. 执行：`glab mr merge <编号> --repo <project> --yes [--squash]`
-3. 清理：`git worktree remove .worktrees/review-<mr>` 与 `base-<mr>`（幂等，失败不阻断）
+3. 清理：干净的 review/base worktree 使用普通 `git worktree remove`；脏 worktree 默认保留，只有 `--force-cleanup` 才强制删除
 4. 输出归档前指引（同步 main → `openspec archive` → archived trailer push）
 
 ## 边界（与相邻技能）

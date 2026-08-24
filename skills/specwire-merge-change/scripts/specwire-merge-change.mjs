@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // specwire-merge-change（许可合并）：校验 MR 关联与状态 → glab mr merge → 清理评审 worktree → 输出归档前指引
-// 用法：node <技能目录>/scripts/specwire-merge-change.mjs <change-id> --mr <编号> [--squash] [--dry-run] [--repo <group/project>]
+// 用法：node <技能目录>/scripts/specwire-merge-change.mjs <change-id> --mr <编号> [--squash] [--force-cleanup] [--allow-non-main] [--dry-run] [--repo <group/project>]
 // 边界：调用即 = 合并许可；不改 change 分支（change/feat-*）；不执行规格归档（仅输出指引）；源分支由 MR/GitLab 设置控制，本技能不删
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -11,10 +11,12 @@ process.on('uncaughtException', (e) => { console.error(`✗ ${e.message}`); proc
 
 function usage() {
   console.log(`用法：
-  node <技能目录>/scripts/specwire-merge-change.mjs <change-id> --mr <编号> [--squash] [--dry-run] [--repo <group/project>]
+  node <技能目录>/scripts/specwire-merge-change.mjs <change-id> --mr <编号> [--squash] [--force-cleanup] [--allow-non-main] [--dry-run] [--repo <group/project>]
 说明：调用即 = 合并许可；先校验 MR 关联与状态，再合并（不改 change 分支、不归档规格）
-  --squash   压缩合并（默认常规 merge commit，保留实现提交与 trailer）
-  --dry-run  只预览将执行的命令与清理清单，不执行`);
+  --squash          压缩合并（默认常规 merge commit，保留实现提交与 trailer）
+  --force-cleanup   强制删除有未提交修改的评审 worktree（需用户明确授权）
+  --allow-non-main  允许目标分支不是 main（需用户明确确认）
+  --dry-run         只预览将执行的命令与清理清单，不执行`);
 }
 
 // ---------- 参数解析 ----------
@@ -23,6 +25,8 @@ let changeId = null;
 let mr = null;
 let repo = null;
 let squash = false;
+let forceCleanup = false;
+let allowNonMain = false;
 let dryRun = false;
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -30,6 +34,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--mr') { mr = argv[++i]; if (!mr) die('--mr 需要编号'); }
   else if (a === '--repo') { repo = argv[++i]; if (!repo) die('--repo 需要 group/project'); }
   else if (a === '--squash') squash = true;
+  else if (a === '--force-cleanup') forceCleanup = true;
+  else if (a === '--allow-non-main') allowNonMain = true;
   else if (a === '--dry-run') dryRun = true;
   else if (a.startsWith('-')) die(`未知参数：${a}`);
   else if (changeId) die('只接受一个 change-id（放 --mr 前）');
@@ -78,6 +84,8 @@ const source = mrd.source_branch;
 const target = mrd.target_branch || 'main';
 if (!source) die(`MR #${mr} 缺少 source_branch`);
 if (mrd.state !== 'opened') die(`MR #${mr} 状态为 ${mrd.state}（只能合并 opened 的 MR）`);
+if (target !== 'main' && !allowNonMain) die(`MR #${mr} 的目标分支是 ${target}，不是 main；确认无误后显式加 --allow-non-main`);
+if (target !== 'main') console.log(`⚠ 已显式允许合并到非 main 目标分支：${target}`);
 const desc = `${mrd.description || ''}\n${mrd.title || ''}`;
 if (!desc.includes(changeId)) die(`MR #${mr} 未关联 change-id「${changeId}」（防合并错 MR）`);
 console.log(`→ 校验通过：MR #${mr}（${source} → ${target}）关联 ${changeId}`);
@@ -86,13 +94,27 @@ console.log(`→ 校验通过：MR #${mr}（${source} → ${target}）关联 ${c
 const mergeCmd = `glab mr merge ${mr} --repo ${repo}${squash ? ' --squash' : ''} --yes`;
 const reviewWt = path.join(repoRoot, '.worktrees', `review-${mr}`);
 const baseWt = path.join(repoRoot, '.worktrees', `base-${mr}`);
+
+function worktreeState(wt) {
+  if (!existsSync(wt)) return { exists: false, dirty: false, error: null };
+  const r = spawnSync('git', ['-C', wt, 'status', '--porcelain'], { encoding: 'utf8' });
+  if (r.status !== 0) return { exists: true, dirty: true, error: (r.stderr || r.stdout || '').trim().slice(0, 160) };
+  return { exists: true, dirty: Boolean(r.stdout.trim()), error: null };
+}
+
 if (dryRun) {
   console.log('\n[dry-run] 将执行：');
   console.log(`  ${mergeCmd}`);
   console.log('  清理：');
-  if (existsSync(reviewWt)) console.log(`  git worktree remove ${reviewWt}`);
-  if (existsSync(baseWt)) console.log(`  git worktree remove ${baseWt}`);
-  if (!existsSync(reviewWt) && !existsSync(baseWt)) console.log('  （无 review/base worktree 需清理）');
+  let found = false;
+  for (const wt of [reviewWt, baseWt]) {
+    const state = worktreeState(wt);
+    if (!state.exists) continue;
+    found = true;
+    if (state.dirty && !forceCleanup) console.log(`  保留 ${wt}（有未提交修改${state.error ? `；状态检查异常：${state.error}` : ''}）`);
+    else console.log(`  git worktree remove${state.dirty ? ' --force' : ''} ${wt}`);
+  }
+  if (!found) console.log('  （无 review/base worktree 需清理）');
   console.log('\n[dry-run] 未执行任何操作。');
   process.exit(0);
 }
@@ -105,8 +127,13 @@ console.log(`✓ MR #${mr} 已合并（${(g.stdout || '').trim().split('\n')[0] 
 
 // ---------- 清理评审 worktree（幂等，失败不阻断） ----------
 for (const wt of [reviewWt, baseWt]) {
-  if (!existsSync(wt)) continue;
-  const r = spawnSync('git', ['worktree', 'remove', '--force', wt], { encoding: 'utf8' });
+  const state = worktreeState(wt);
+  if (!state.exists) continue;
+  if (state.dirty && !forceCleanup) {
+    console.log(`⚠ 已保留有未提交修改的 worktree：${wt}${state.error ? `（状态检查异常：${state.error}）` : ''}；确认可丢弃后再用 --force-cleanup`);
+    continue;
+  }
+  const r = spawnSync('git', ['worktree', 'remove', ...(state.dirty ? ['--force'] : []), wt], { encoding: 'utf8' });
   console.log(r.status === 0 ? `→ 已清理：${wt}` : `⚠ 清理失败（可稍后手动）：${wt} —— ${(r.stderr || '').trim().slice(0, 120)}`);
 }
 
